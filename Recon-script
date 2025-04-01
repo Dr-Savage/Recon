@@ -1,0 +1,222 @@
+#!/bin/bash
+
+echo		"██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗    ███████╗ ██████╗██████╗ ██╗██████╗ ████████╗"    
+echo		"██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║    ██╔════╝██╔════╝██╔══██╗██║██╔══██╗╚══██╔══╝"    
+echo		"██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║    ███████╗██║     ██████╔╝██║██████╔╝   ██║   "    
+echo		"██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║    ╚════██║██║     ██╔══██╗██║██╔═══╝    ██║   "    
+echo		"██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║    ███████║╚██████╗██║  ██║██║██║        ██║   "    
+echo		"╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝    ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝╚═╝        ╚═╝   "    
+                                                                                   
+FILE=subdomains.txt
+
+bash_vlookup(){
+root_domains=$(cat $FILE)
+
+while IFS= read -r url; do
+    for root_domain in $root_domains; do
+        if [[ $url == *$root_domain* ]]; then
+            echo "$url" >> shodan_final_output.txt
+            break
+        fi
+    done
+done < shodan_unique_urls.txt
+#add shodan_final_output to combined input for puredns?
+cat shodan_final_output.txt >> combined_input_for_pureDNS.txt
+}
+
+
+only_subdomains(){
+  if [ -f "$FILE" ]; then
+    echo "Subdomain file exists....run subdomains enumeration on these"
+    subfinder -dL "$FILE" -o subs_only_subfinder.txt
+    cat "$FILE" | assetfinder -subs-only | tee subs_only_assetfinder.txt
+    amass enum -passive -df "$FILE" -o subs_only_amass.txt
+    cat subs_only_*.txt | sort -u >> combined_input_for_pureDNS.txt
+fi
+rm subs_only_*.txt
+}
+
+
+shodan_func(){
+shodan init "{API KEY}"
+while read -r domain;
+do
+   shodan domain -D $domain -S   
+   if [ -f "${domain}-hosts.json.gz" ];
+   then
+   echo "$domain-hosts.json.gz"
+   gzip -d *.gz
+   jq -r '.hostnames' "$domain"-hosts.json | grep \" >> $domain.txt
+   sed 's/\"//g' "$domain".txt
+   sleep 10
+   else
+   echo $domain >> Error.txt
+   sleep 10
+   fi
+   #logic here to immediatley remove file after putting the domains in shodan_combined.
+   sed -i 's/[ ",]//g' "$domain.txt"
+   cat "$domain.txt" >> shodan_combined.txt
+   rm "$domain"*
+done < "$FILE"
+
+
+shodan search asn:{} --fields hostnames | tr ";" "\n" | sort -u >> shodan_combined.txt
+cat shodan_combined.txt | sort -u >> shodan_unique_urls.txt
+rm shodan_combined.txt
+bash_vlookup
+
+}
+
+
+check_resolvable_and_live(){
+#Using PureDNS: puredns is a fast domain resolver and subdomain bruteforcing tool that can accurately filter out wildcard subdomains and DNS poisoned entries
+#Running Puredns on all combined domains from organizations ... 
+echo "[+]Resolving subdomains with PureDNS..."
+
+echo "8.8.8.8" >> resolvers.txt
+echo "8.8.4.4" >> resolvers.txt
+puredns resolve combined_input_for_pureDNS.txt -r resolvers.txt -w combined_output_pureDNS.txt
+
+
+#Running httpx...
+echo "[+]Using HTTPX for Live Subdomains..."
+httpx -l combined_output_pureDNS.txt -p 66,80,81,443,445,457,1080,1100,1241,1352,1433,1434,1521,1944,2301,3000,3128,3306,4000,4001,4002,4100,5000,5432,5800,5801,5802,6346,6347,7001,7002,8001,8002,8080,8989,8443,8888,9071,9074,9073,9502,9500,30821 -timeout 10 -sc -fr -location -title -server -td -ip -cname -asn -probe -method -o Raw_Output.txt
+cat Raw_Output.txt | grep "SUCCESS" | tee Raw_httpx_Output.txt
+rm Raw_Output.txt
+cat Raw_httpx_Output.txt | cut -d " " -f 1 | tee LIVE_SUBDOMAINS.txt
+rm Raw_httpx_Output.txt
+}
+
+check_if_any_folders_exist(){
+
+  local folders=($(find . -maxdepth 1 -type d)) 
+  if [ ${#folders[@]} -eq 1 ]; then
+      check_resolvable_and_live
+  else
+      #echo "Waiting for folders to be deleted..."
+      sleep 10000  # Sleep for 10 second
+      check_if_any_folders_exist
+  fi
+
+}
+
+
+
+
+#Function start from here:-
+loop_func(){
+
+#Creating directories for all the Registrant Organization Name present in org_names.txt
+mkdir -p "$org"
+
+#Whoxy is a tool used to do reverse whois on Registrant Organization Names (e.g. Registrant of fisglobal.com is Fidelity National Information Services). So whoxyrm helps to find all the root domains which belongs to Fidelity National Information Services.
+  whoxyrm -company-name "$org" |  tee "$org"/company_domains.txt
+	whoxyrm -name "$org" |  tee "$org"/owner_domains.txt
+	cat "$org"/company_domains.txt "$org"/owner_domains.txt | sort -u | tee "$org"/all_root_domains.txt 
+	
+#Here we are again doing whois on all the all_root_domains to remove the false postive which we got from reverse whois (whoxyrm). 
+
+
+#Whois loop
+while read -r line;
+do 
+echo -en "$line" >> "$org"/whois.txt; 
+echo -en "=" >> "$org"/whois.txt; 
+curl -s -k "https://api.whoxy.com/?key={}&whois=$line" > "$org"/data_temp.txt
+
+result1=$(jq -r '.registrant_contact.company_name' "$org"/data_temp.txt | tr "," " ")
+result2=$(jq -r '.administrative_contact.company_name' "$org"/data_temp.txt | tr "," " ")
+result3=$(jq -r '.technical_contact.email_address' "$org"/data_temp.txt | tr "," " ") 
+
+if [[ $result1 == "null" && $result2 == "null" && $result3 == "null" ]];  then
+        whois $line > "$org"/data_temp.txt          
+        result1=$(cat "$org"/data_temp.txt | grep -oP '(?<=Registrant Organization: ).*'  | tr "," " ");
+        result2=$(cat "$org"/data_temp.txt | grep -oP '(?<=Admin Organization: ).*' | tr "," " ");
+        result3=$(cat "$org"/data_temp.txt | grep -oP '(?<=Admin Email: ).*' | tr "," " ");
+fi 
+
+echo -en "$result1%$result2%$result3\n" >> "$org"/whois.txt
+done < "$org"/all_root_domains.txt
+
+awk -F'[%=]' '{for(i=2; i<=NF; i++) print $1 "=" $i}' "$org"/whois.txt | tee "$org"/domains_with_registrar.txt | grep "$org" | cut -d "=" -f 1 | sort -u | tee "$org"/root_domains.txt
+
+rm "$org"/data_temp.txt
+#  rm"$org"/whois.txt 
+
+
+
+
+
+
+
+#Using subfinder for enumerating the subdomains.
+	echo "[+]Harvesting subdomains with Subfinder..."
+  subfinder -dL "$org"/root_domains.txt -o "$org"/subfinder.txt
+	cat "$org"/subfinder.txt >> combined_subfinder.txt
+
+#Using Assetfinder for enumerating the subdomains.
+	cat "$org"/root_domains.txt | assetfinder -subs-only | tee "$org"/assetfinder.txt
+	cat "$org"/assetfinder.txt >> combined_assetfinder.txt
+
+#Using amass for enumerating the subdomains.
+	echo "[+]Harvesting subdomains with Amass..."
+	amass enum -passive -df "$org"/root_domains.txt -o "$org"/amass.txt
+  cat "$org"/amass.txt >> combined_amass.txt
+
+#Combining the output of subfinder and amass.
+	echo "[+]Combining the Subdomains..."
+	cat "$org"/amass.txt "$org"/subfinder.txt "$org"/assetfinder.txt "$org"/root_domains.txt >> "$org"/unresolved_subdomains.txt
+	cat  "$org"/unresolved_subdomains.txt | sort -u | tee "$org"/input_for_pureDNS.txt
+
+  
+	
+cat "$org"/input_for_pureDNS.txt >> combined_input_for_pureDNS.txt
+rm -rf "$org"
+
+}
+
+
+
+
+
+#.................................Starting of the Script..........................
+
+
+if [ "$EUID" -ne 0 ];then
+    echo "Please run this script as root user"
+    exit 1
+fi
+
+echo "Welcome to FIS Recon Script"
+export WHOXY_API_KEY={}
+
+#Taking input in text file.
+input="domains.txt"		
+echo "Given Domains are":-
+
+#Finding the Registrant Organization Name in the below loop (e.g. fisglobal.com belongs to Fidelity National Information Services)
+while IFS= read -r line
+do
+		echo $line
+        curl -s -k "https://api.whoxy.com/?key={}&whois=$line" | grep -m 1 -oP '(?<=company_name": ").*(?=",)' >> name.txt
+done < "$input"
+cat name.txt | sort -u >> org_names.txt
+rm name.txt
+
+#Starting a while loop in which we are calling function 'loop_func' with input file org which is org_names.txt
+#Note: Reason for creating a function here is to perform recon simultaneously on all the Registrant Organization Name present in org_names.txt
+
+while IFS= read -r org
+do
+    loop_func "$org" &
+
+done < org_names.txt
+
+#Executing other functions...
+shodan_func
+only_subdomains
+check_if_any_folders_exist
+
+# The last function does the following :
+# If any folder exists --> if yes, wait...
+# If no folders exists then proceed --> and execute the function --> check_resolvable_and_live ...
